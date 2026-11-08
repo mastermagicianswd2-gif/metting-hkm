@@ -209,6 +209,10 @@
 
       <!-- Tombol Aksi Tambahan -->
       <div class="flex items-center gap-2">
+        <button onclick="showDiagnostics()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-700/70 hover:bg-slate-800 text-slate-300 text-xs font-medium transition-all" title="Lihat status koneksi video/suara">
+          <i data-lucide="activity" class="w-3.5 h-3.5"></i>
+          <span class="hidden sm:inline">Diagnostik</span>
+        </button>
         <button onclick="addSimulatedUser()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-950/60 border border-indigo-700/50 hover:bg-indigo-900/60 text-indigo-300 text-xs font-medium transition-all" title="Simulasi user lain untuk uji coba tampilan">
           <i data-lucide="user-plus" class="w-3.5 h-3.5"></i>
           <span class="hidden sm:inline">Uji Partisipan</span>
@@ -407,7 +411,16 @@
   <!-- JAVASCRIPT APLIKASI UTAMA                 -->
   <!-- ========================================== -->
   <script>
-    const APPS_SCRIPT_URL_DEFAULT = "https://script.google.com/macros/s/AKfycbx1ZtH7xDcj87OO1PV0xjEc_FlvOCSVBYJBkK4I3mrn_xBFKqAhO9Ogd0u0f8oYC6CTiw/exec"; 
+    const APPS_SCRIPT_URL_DEFAULT = "https://script.google.com/macros/s/AKfycbx1ZtH7xDcj87OO1PV0xjEc_FlvOCSVBYJBkK4I3mrn_xBFKqAhO9Ogd0u0f8oYC6CTiw/exec";
+
+    // ==============================================================
+    // KONFIGURASI TURN (sangat disarankan; tanpa ini video sering gagal
+    // tersambung di jaringan seluler / WiFi kantor atau sekolah)
+    // Daftar gratis di https://www.metered.ca/tools/openrelay/ (20 GB/bulan),
+    // lalu isi SALAH SATU di bawah ini:
+    // ==============================================================
+    const TURN_API_KEY = "";   // cara mudah: tempel API key Open Relay/Metered di sini
+    const TURN_MANUAL = [];    // atau manual: [{ urls: 'turn:host:443', username: '...', credential: '...' }] 
 
     // --- State Global Aplikasi ---
     const state = {
@@ -446,7 +459,14 @@
       silentCtx: null,
       virtualTimer: null,
       audioUnlockHinted: false,
-      peerErrorHinted: false
+      peerErrorHinted: false,
+      peerInfo: {},
+      hostPeerId: '',
+      hostConnected: false,
+      hostRetry: 0,
+      iceState: {},
+      rosterIds: [],
+      hasTurn: false
     };
 
     const avatarColors = [
@@ -509,7 +529,7 @@
     function generateRoomCode() {
       const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
       let p2 = '';
-      for (let i = 0; i < 3; i++) p2 += chars.charAt(Math.floor(Math.random() * chars.length));
+      for (let i = 0; i < 4; i++) p2 += chars.charAt(Math.floor(Math.random() * chars.length));
       return `TR-${p2}`;
     }
 
@@ -746,6 +766,7 @@
       if (state.audioContext && state.audioContext.state === 'suspended') {
         state.audioContext.resume();
       }
+      broadcastState();
       updateMicUI();
     }
 
@@ -801,6 +822,7 @@
           track.enabled = state.isVideoOn;
         });
       }
+      broadcastState();
       updateCamUI();
     }
 
@@ -934,29 +956,48 @@
         btn.className = "p-3.5 rounded-2xl bg-slate-800/90 text-slate-200 hover:bg-slate-700 transition-all shadow-md";
         if (badge) badge.classList.add('hidden');
       }
+      broadcastState();
     }
 
     // ==============================================================
     // PEERJS WEBRTC LIVE VIDEO & AUDIO STREAMING
     // ==============================================================
-    // STUN saja tidak cukup untuk banyak jaringan seluler/kantor (NAT ketat).
-    // Server TURN publik gratis di bawah ini hanya cadangan; untuk pemakaian serius,
-    // daftar akun TURN sendiri (mis. Metered) dan ganti username/credential-nya.
-    const ICE_SERVERS = [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:global.stun.twilio.com:3478' },
-      {
-        urls: [
-          'turn:openrelay.metered.ca:80',
-          'turn:openrelay.metered.ca:443',
-          'turn:openrelay.metered.ca:443?transport=tcp'
-        ],
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-      }
-    ];
+    // ID PeerJS host diturunkan dari kode ruangan, sehingga peserta bisa langsung
+    // menyambung tanpa menunggu spreadsheet (inilah yang menghilangkan delay).
+    function hostPeerIdFor(code) {
+      return 'tmr-h-' + String(code).toLowerCase().replace(/[^a-z0-9]/g, '');
+    }
 
-    function initPeerConnection() {
+    async function getIceServers() {
+      const base = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:global.stun.twilio.com:3478' }
+      ];
+      state.hasTurn = false;
+      if (Array.isArray(TURN_MANUAL) && TURN_MANUAL.length) {
+        state.hasTurn = true;
+        return base.concat(TURN_MANUAL);
+      }
+      if (TURN_API_KEY) {
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 5000);
+          const res = await fetch('https://openrelayproject.metered.ca/api/v1/turn/credentials?apiKey=' + encodeURIComponent(TURN_API_KEY), { signal: ctrl.signal });
+          clearTimeout(timer);
+          const list = await res.json();
+          if (Array.isArray(list) && list.length) {
+            state.hasTurn = true;
+            return base.concat(list);
+          }
+        } catch (e) {
+          console.warn("Gagal mengambil kredensial TURN:", e);
+        }
+      }
+      return base;
+    }
+
+    async function initPeerConnection() {
       try {
         if (typeof Peer === 'undefined') {
           showToast("Pustaka PeerJS gagal dimuat. Periksa koneksi internet.", "error");
@@ -969,53 +1010,103 @@
         state.dataConns = {};
         state.remoteScreen = {};
         state.callAttempts = {};
+        state.peerInfo = {};
+        state.iceState = {};
+        state.rosterIds = [];
+        state.hostConnected = false;
 
-        // Buat Peer dengan id unik berbasis userId
-        state.peer = new Peer(state.userId, {
-          debug: 1,
-          config: { iceServers: ICE_SERVERS }
-        });
+        const iceServers = await getIceServers();
 
-        state.peer.on('open', (id) => {
+        // Pengguna mungkin sudah keluar selama menunggu kredensial
+        const roomScreen = document.getElementById('roomScreen');
+        if (!roomScreen || roomScreen.classList.contains('hidden')) return;
+
+        const peer = new Peer(state.userId, { debug: 1, config: { iceServers } });
+        state.peer = peer;
+
+        peer.on('open', (id) => {
           console.log("PeerJS Terhubung dengan ID:", id);
+          if (state.isHost) {
+            state.hostConnected = true;
+            showToast(`Ruang ${state.roomCode} siap. Bagikan kodenya ke peserta.`, "success");
+            // Spreadsheet hanya dipakai untuk pencatatan, tidak lagi menentukan koneksi
+            if (state.apiUrl) {
+              callAppsScript('createRoom', { roomCode: state.roomCode, hostId: state.userId, hostName: state.userName });
+            }
+          } else {
+            connectToPeer(state.hostPeerId);
+          }
         });
 
-        // Menerima panggilan video/audio dari peserta lain
-        state.peer.on('call', (call) => {
+        // Panggilan video/audio dari peserta lain
+        peer.on('call', (call) => {
           call.answer(state.localStream);
           registerCall(call);
         });
 
-        // Kanal data kecil untuk sinyal "sedang berbagi layar"
-        state.peer.on('connection', (conn) => setupDataConn(conn));
+        // Kanal data: status mic/kamera, chat, daftar peserta
+        peer.on('connection', (conn) => setupDataConn(conn));
 
-        state.peer.on('disconnected', () => {
-          if (state.peer && !state.peer.destroyed) {
-            try { state.peer.reconnect(); } catch (e) {}
+        peer.on('disconnected', () => {
+          if (state.peer === peer && !peer.destroyed) {
+            try { peer.reconnect(); } catch (e) {}
           }
         });
 
-        state.peer.on('error', (err) => {
-          console.warn("PeerJS error:", err && err.type, err);
+        peer.on('error', (err) => {
           const type = err && err.type;
+          const msg = String((err && err.message) || '');
+          console.warn("PeerJS error:", type, err);
 
-          // Peserta yang dituju belum siap: lepas panggilan itu supaya dicoba lagi pada sinkronisasi berikutnya
-          if (type === 'peer-unavailable') {
-            const m = String(err.message || '').match(/user_[a-z0-9]+/);
-            if (m && state.calls[m[0]] && !state.remoteStreams[m[0]]) {
-              try { state.calls[m[0]].close(); } catch (e) {}
-              delete state.calls[m[0]];
+          // Kode ruangan kebetulan sudah dipakai orang lain: buat kode baru
+          if (type === 'unavailable-id') {
+            if (state.isHost && state.hostRetry < 5) {
+              state.hostRetry++;
+              restartHostWithNewCode();
+            } else {
+              showToast("ID koneksi bentrok. Muat ulang halaman lalu coba lagi.", "error");
             }
             return;
           }
+
+          if (type === 'peer-unavailable') {
+            // Host tidak ditemukan: kode salah atau host belum membuka ruangan
+            if (!state.isHost && state.hostPeerId && msg.includes(state.hostPeerId) && !state.hostConnected) {
+              showToast("Rapat tidak ditemukan atau host belum online. Periksa kode ruangan.", "error");
+              confirmLeaveMeeting();
+              return;
+            }
+            const m = msg.match(/tmr-[hp]-[a-z0-9]+/);
+            if (m) {
+              const pid = m[0];
+              const c = state.dataConns[pid];
+              if (c && !c.open) delete state.dataConns[pid];
+              const call = state.calls[pid];
+              if (call && !state.remoteStreams[pid]) {
+                try { call.close(); } catch (e) {}
+                delete state.calls[pid];
+              }
+            }
+            return;
+          }
+
           if (!state.peerErrorHinted && ['network', 'server-error', 'socket-error', 'socket-closed', 'browser-incompatible'].includes(type)) {
             state.peerErrorHinted = true;
-            showToast("Server penghubung video (PeerJS) bermasalah: " + type, "error");
+            showToast("Server penghubung rapat (PeerJS) bermasalah: " + type, "error");
           }
         });
       } catch (err) {
         console.warn("PeerJS gagal diinisialisasi:", err);
       }
+    }
+
+    function restartHostWithNewCode() {
+      state.roomCode = generateRoomCode();
+      state.hostPeerId = hostPeerIdFor(state.roomCode);
+      state.userId = state.hostPeerId;
+      const h = document.getElementById('headerRoomCode');
+      if (h) h.innerText = state.roomCode;
+      initPeerConnection();
     }
 
     // Daftarkan panggilan (baik yang kita mulai maupun yang kita jawab)
@@ -1041,6 +1132,18 @@
       };
       call.on('close', drop);
       call.on('error', drop);
+
+      // Pantau status koneksi (ditampilkan di kartu peserta dan di tombol Diagnostik)
+      const pc = call.peerConnection;
+      if (pc) {
+        pc.addEventListener('iceconnectionstatechange', () => {
+          state.iceState[id] = pc.iceConnectionState;
+          if (pc.iceConnectionState === 'failed' && state.calls[id] === call) {
+            try { call.close(); } catch (e) {}
+          }
+          updateRemoteCardById(id);
+        });
+      }
 
       // Jika 20 detik tidak ada video/suara yang masuk, anggap gagal supaya dicoba ulang
       setTimeout(() => {
@@ -1096,49 +1199,238 @@
       }
     }
 
-    // --- Sinyal kecil antar peserta (status berbagi layar) ---
+    // --- Kanal data antar peserta (status, chat, daftar peserta) ---
+    function myInfo() {
+      return {
+        userName: state.userName,
+        isMicOn: !!state.isMicOn,
+        isVideoOn: !!(state.isVideoOn || state.isScreenSharing),
+        isHandRaised: !!state.isHandRaised,
+        isScreenSharing: !!state.isScreenSharing
+      };
+    }
+
+    function cleanInfo(raw, peerId) {
+      raw = raw || {};
+      return {
+        userName: String(raw.userName || 'Peserta').slice(0, 30),
+        isMicOn: !!raw.isMicOn,
+        isVideoOn: !!raw.isVideoOn,
+        isHandRaised: !!raw.isHandRaised,
+        isHost: peerId === state.hostPeerId   // host ditentukan dari ID, tidak bisa dipalsukan
+      };
+    }
+
+    function sendTo(conn, msg) {
+      if (!conn || !conn.open) return;
+      try { conn.send(msg); } catch (e) { console.warn("Gagal kirim data:", e); }
+    }
+
+    function broadcast(msg) {
+      Object.values(state.dataConns).forEach(c => sendTo(c, msg));
+    }
+
+    function broadcastState() {
+      broadcast({ type: 'state', info: myInfo() });
+    }
+
+    function broadcastRoster() {
+      broadcast({ type: 'roster', list: [state.userId, ...Object.keys(state.dataConns)] });
+    }
+
+    function connectToPeer(id) {
+      if (!state.peer || !state.peer.open || !id || id === state.userId) return;
+      if (state.dataConns[id]) return;
+      let conn;
+      try { conn = state.peer.connect(id, { reliable: true }); } catch (e) { return; }
+      if (conn) setupDataConn(conn);
+    }
+
     function setupDataConn(conn) {
-      state.dataConns[conn.peer] = conn;
-      conn.on('data', (data) => handleSignal(conn.peer, data));
-      conn.on('open', () => {
-        if (state.isScreenSharing) { try { conn.send({ type: 'screen', on: true }); } catch (e) {} }
+      const id = conn.peer;
+      conn.__created = Date.now();
+      const prev = state.dataConns[id];
+      state.dataConns[id] = conn;
+      if (prev && prev !== conn) { try { prev.close(); } catch (e) {} }
+
+      const onOpen = () => {
+        if (id === state.hostPeerId) state.hostConnected = true;
+        sendTo(conn, { type: 'hello', info: myInfo() });
+        callRemotePeer(id);
+      };
+      if (conn.open) onOpen(); else conn.on('open', onOpen);
+
+      conn.on('data', (data) => handleSignal(id, data, conn));
+      conn.on('close', () => {
+        if (state.dataConns[id] === conn) {
+          delete state.dataConns[id];
+          onPeerGone(id);
+        }
       });
-      conn.on('close', () => { if (state.dataConns[conn.peer] === conn) delete state.dataConns[conn.peer]; });
-      conn.on('error', () => {});
+      conn.on('error', (e) => console.warn("Kanal data error:", id, e));
     }
 
-    function sendScreenSignal(peerId, on) {
+    function handleSignal(id, data, conn) {
+      if (!data || typeof data !== 'object') return;
+
+      switch (data.type) {
+        case 'hello': {
+          const isNew = !state.peerInfo[id];
+          const info = cleanInfo(data.info, id);
+          state.peerInfo[id] = info;
+          state.remoteScreen[id] = !!(data.info && data.info.isScreenSharing);
+          refreshParticipants();
+          if (isNew) {
+            playTone('join');
+            showToast(`${info.userName} bergabung ke rapat`, "info");
+          }
+          if (state.isHost) {
+            sendTo(conn, { type: 'history', messages: state.messages.slice(-200) });
+            broadcastRoster();
+          }
+          callRemotePeer(id);
+          break;
+        }
+        case 'state': {
+          if (!state.peerInfo[id]) break;
+          state.peerInfo[id] = cleanInfo(data.info, id);
+          state.remoteScreen[id] = !!(data.info && data.info.isScreenSharing);
+          refreshParticipants();
+          break;
+        }
+        case 'screen': {
+          state.remoteScreen[id] = !!data.on;
+          updateRemoteCardById(id);
+          break;
+        }
+        case 'roster': {
+          if (id !== state.hostPeerId || !Array.isArray(data.list)) break;
+          state.rosterIds = data.list.filter(x => typeof x === 'string' && /^tmr-[hp]-[a-z0-9]+$/.test(x)).slice(0, 100);
+          ensureLinks();
+          break;
+        }
+        case 'chat': {
+          onChatReceived(data.msg, false);
+          break;
+        }
+        case 'history': {
+          if (id !== state.hostPeerId || !Array.isArray(data.messages)) break;
+          data.messages.forEach(m => onChatReceived(m, true));
+          break;
+        }
+      }
+    }
+
+    // Peserta ber-ID lebih besar yang menyambung ke yang lebih kecil (host selalu paling kecil)
+    function ensureLinks() {
       if (!state.peer || !state.peer.open) return;
-      let conn = state.dataConns[peerId];
-      if (!conn) {
-        try { conn = state.peer.connect(peerId, { reliable: true }); } catch (e) { return; }
-        setupDataConn(conn);
-      }
-      // Jika kanal belum terbuka, status terkini dikirim otomatis saat kanal terbuka
-      if (conn.open) { try { conn.send({ type: 'screen', on: !!on }); } catch (e) {} }
+      state.rosterIds.forEach(pid => {
+        if (pid !== state.userId && state.userId > pid) connectToPeer(pid);
+      });
     }
 
-    function sendScreenSignalAll(on) {
-      Object.keys(state.calls).forEach(id => sendScreenSignal(id, on));
+    // Dijalankan berkala: sambungkan ulang yang putus/macet
+    function maintainLinks() {
+      if (!state.peer || !state.peer.open) return;
+      const now = Date.now();
+      Object.keys(state.dataConns).forEach(pid => {
+        const c = state.dataConns[pid];
+        if (c && !c.open && now - (c.__created || 0) > 15000) {
+          delete state.dataConns[pid];
+          try { c.close(); } catch (e) {}
+        }
+      });
+      if (!state.isHost && !state.hostConnected) connectToPeer(state.hostPeerId);
+      ensureLinks();
+      Object.keys(state.peerInfo).forEach(callRemotePeer);
     }
 
-    function handleSignal(peerId, data) {
-      if (data && data.type === 'screen') {
-        state.remoteScreen[peerId] = !!data.on;
-        updateRemoteCardById(peerId);
+    function refreshParticipants() {
+      const demos = state.remoteParticipants.filter(p => String(p.userId).startsWith('demo_'));
+      const real = Object.keys(state.peerInfo).map(pid => Object.assign({ userId: pid, roomId: state.roomCode }, state.peerInfo[pid]));
+      state.remoteParticipants = real.concat(demos);
+      renderRemoteCards();
+      renderParticipantsList();
+    }
+
+    function onPeerGone(id) {
+      const info = state.peerInfo[id];
+      delete state.peerInfo[id];
+      cleanupPeer(id);
+      refreshParticipants();
+      if (info) showToast(`${info.userName} keluar dari rapat`, "info");
+      if (!state.isHost && id === state.hostPeerId) {
+        state.hostConnected = false;
+        showToast("Koneksi ke host terputus, mencoba menyambung kembali...", "error");
       }
+    }
+
+    function onChatReceived(raw, silent) {
+      if (!raw || typeof raw.text !== 'string' || !raw.text) return;
+      const msg = {
+        roomId: state.roomCode,
+        userId: String(raw.userId || ''),
+        senderName: String(raw.senderName || 'Peserta').slice(0, 40),
+        text: raw.text.slice(0, 2000),
+        timestamp: Number(raw.timestamp) || Date.now()
+      };
+      if (state.messages.some(m => m.userId === msg.userId && m.timestamp === msg.timestamp && m.text === msg.text)) return;
+      state.messages.push(msg);
+      state.messages.sort((a, b) => a.timestamp - b.timestamp);
+      if (!silent && msg.userId !== state.userId && state.activeDrawerTab !== 'chat') {
+        state.unreadChatCount++;
+        updateChatBadge();
+        playTone('ding');
+      }
+      renderChatMessages();
+    }
+
+    // Kirim status terbaru ke satu peserta / semua peserta
+    function sendScreenSignal(peerId) {
+      sendTo(state.dataConns[peerId], { type: 'state', info: myInfo() });
+    }
+
+    function sendScreenSignalAll() {
+      broadcastState();
     }
 
     function cleanupPeer(userId) {
       const call = state.calls[userId];
-      if (call) { try { call.close(); } catch (e) {} }
       delete state.calls[userId];
       delete state.remoteStreams[userId];
       delete state.remoteScreen[userId];
       delete state.callAttempts[userId];
+      delete state.iceState[userId];
+      if (call) { try { call.close(); } catch (e) {} }
       const conn = state.dataConns[userId];
-      if (conn) { try { conn.close(); } catch (e) {} }
       delete state.dataConns[userId];
+      if (conn) { try { conn.close(); } catch (e) {} }
+    }
+
+    // Diagnostik koneksi (tombol di header)
+    function showDiagnostics() {
+      const warn = document.getElementById('protocolWarning');
+      const warnText = document.getElementById('protocolWarningText');
+      if (!warn || !warnText) return;
+      if (warn.dataset.diag === '1') {
+        warn.dataset.diag = '';
+        warn.classList.add('hidden');
+        warn.classList.remove('flex');
+        return;
+      }
+      const parts = [];
+      parts.push('Server penghubung: ' + (state.peer && state.peer.open ? 'terhubung' : 'BELUM terhubung'));
+      parts.push('Kamera: ' + (state.hasRealVideo ? 'ada' : 'tidak ada') + ', Mic: ' + (state.hasRealAudio ? 'ada' : 'tidak ada'));
+      if (!state.isHost) parts.push('Host: ' + (state.hostConnected ? 'tersambung' : 'BELUM tersambung'));
+      parts.push('TURN: ' + (state.hasTurn ? 'aktif' : 'TIDAK ADA (isi TURN_API_KEY bila video gagal di jaringan seluler/kantor)'));
+      Object.keys(state.peerInfo).forEach(pid => {
+        parts.push(`${state.peerInfo[pid].userName}: ice=${state.iceState[pid] || '-'}, video/suara=${state.remoteStreams[pid] ? 'masuk' : 'belum'}`);
+      });
+      if (!Object.keys(state.peerInfo).length) parts.push('Belum ada peserta lain yang tersambung');
+      warnText.innerText = parts.join(' | ');
+      warn.dataset.diag = '1';
+      warn.classList.remove('hidden');
+      warn.classList.add('flex');
     }
 
     // ==============================================================
@@ -1177,22 +1469,16 @@
 
       state.userName = name;
       state.isHost = true;
+      state.hostRetry = 0;
       state.roomCode = generateRoomCode();
+      state.hostPeerId = hostPeerIdFor(state.roomCode);
+      state.userId = state.hostPeerId;
 
       const btn = document.getElementById('btnCreateMeeting');
       btn.disabled = true;
       btn.innerHTML = `<span>Membuat Ruangan...</span>`;
 
-      if (state.apiUrl) {
-        await callAppsScript('createRoom', {
-          roomCode: state.roomCode,
-          hostId: state.userId,
-          hostName: state.userName
-        });
-      }
-
       enterRoom();
-      showToast(`Rapat dibuat! Kode akses: ${state.roomCode}`, "success");
     }
 
     async function joinMeeting() {
@@ -1210,25 +1496,17 @@
 
       state.userName = name;
       state.isHost = false;
+      state.hostRetry = 0;
       state.roomCode = code;
+      state.hostPeerId = hostPeerIdFor(code);
+      state.userId = 'tmr-p-' + Math.random().toString(36).substring(2, 11);
 
       const btn = document.getElementById('btnJoinMeeting');
       btn.disabled = true;
-      btn.innerText = "Cek...";
-
-      if (state.apiUrl) {
-        const check = await callAppsScript('checkRoom', { roomCode: code });
-        if (check && check.exists === false) {
-          btn.disabled = false;
-          btn.innerHTML = `<span>Masuk</span><i data-lucide="chevron-right" class="w-4 h-4"></i>`;
-          lucide.createIcons();
-          showToast("Kode rapat tidak ditemukan di Spreadsheet!", "error");
-          return;
-        }
-      }
+      btn.innerText = "Masuk...";
 
       enterRoom();
-      showToast(`Bergabung ke ruang ${code}`, "success");
+      showToast(`Menghubungkan ke ruang ${code}...`, "info");
     }
 
     function enterRoom() {
@@ -1258,12 +1536,9 @@
       startTimer();
       playTone('join');
 
-      // Aktifkan WebRTC Peer
+      // Aktifkan WebRTC Peer (sinyal, chat, dan status lewat PeerJS, bukan spreadsheet)
       initPeerConnection();
-
-      // Mulai sinkronisasi berkala ke Google Apps Script (Heartbeat & Chat)
-      syncWithSpreadsheet();
-      state.pollInterval = setInterval(syncWithSpreadsheet, 3500);
+      state.pollInterval = setInterval(maintainLinks, 5000);
 
       lucide.createIcons();
     }
@@ -1271,68 +1546,6 @@
     // ==============================================================
     // SINKRONISASI DATABASE GOOGLE SHEETS
     // ==============================================================
-    async function syncWithSpreadsheet() {
-      if (!state.apiUrl || !state.roomCode || state.syncing) return;
-      state.syncing = true;
-      try {
-        // 1. Kirim Heartbeat status sendiri (berbagi layar dihitung sebagai video aktif)
-        callAppsScript('updateParticipant', {
-          roomId: state.roomCode,
-          userId: state.userId,
-          userName: state.userName,
-          isMicOn: state.isMicOn ? '1' : '0',
-          isVideoOn: (state.isVideoOn || state.isScreenSharing) ? '1' : '0',
-          isHandRaised: state.isHandRaised ? '1' : '0',
-          isHost: state.isHost ? '1' : '0'
-        });
-
-        // 2. Ambil partisipan aktif lain
-        const partRes = await callAppsScript('getParticipants', { roomId: state.roomCode });
-        if (partRes && partRes.status === 'success' && Array.isArray(partRes.data)) {
-          const now = Date.now();
-          const fresh = partRes.data.filter(p => p.userId !== state.userId);
-          const freshIds = new Set(fresh.map(p => p.userId));
-          fresh.forEach(p => { state.lastSeen[p.userId] = now; });
-
-          // Toleransi 30 detik: spreadsheet bisa lambat, jangan langsung memutus peserta
-          const kept = state.remoteParticipants.filter(p =>
-            !freshIds.has(p.userId) &&
-            (p.userId.startsWith('demo_') || now - (state.lastSeen[p.userId] || 0) < 30000)
-          );
-          const keptIds = new Set(kept.map(p => p.userId));
-          state.remoteParticipants.forEach(p => {
-            if (!freshIds.has(p.userId) && !keptIds.has(p.userId)) cleanupPeer(p.userId);
-          });
-          state.remoteParticipants = [...fresh, ...kept];
-
-          // Panggil peer WebRTC untuk partisipan yang ditemukan
-          state.remoteParticipants.forEach(p => {
-            if (!p.userId.startsWith('demo_')) callRemotePeer(p.userId);
-          });
-
-          renderRemoteCards();
-          renderParticipantsList();
-        }
-
-        // 3. Ambil pesan chat terbaru
-        const msgRes = await callAppsScript('getMessages', { roomId: state.roomCode });
-        if (msgRes && msgRes.status === 'success' && Array.isArray(msgRes.data)) {
-          if (msgRes.data.length > state.messages.length && state.activeDrawerTab !== 'chat') {
-            const newest = msgRes.data[msgRes.data.length - 1];
-            if (newest.userId !== state.userId) {
-              state.unreadChatCount++;
-              updateChatBadge();
-              playTone('ding');
-            }
-          }
-          state.messages = msgRes.data;
-          renderChatMessages();
-        }
-      } finally {
-        state.syncing = false;
-      }
-    }
-
     // ==============================================================
     // RENDER VIDEO GRID PARTISIPAN (EFISIEN, TIDAK ME-RESET LOKAL)
     // ==============================================================
@@ -1431,7 +1644,10 @@
       }
       vid.className = `w-full h-full ${sharing ? 'object-contain bg-black' : 'object-cover'} ${showVideo ? 'opacity-100' : 'opacity-0'}`;
 
-      const statusText = !stream ? 'Menghubungkan video...' : 'Kamera Mati';
+      const ice = state.iceState[p.userId];
+      const statusText = stream ? 'Kamera Mati'
+        : (ice === 'failed' ? 'Koneksi gagal (jaringan butuh TURN), mencoba ulang...'
+        : 'Menghubungkan video...' + (ice ? ' (' + ice + ')' : ''));
 
       overlay.innerHTML = `
         <div class="${showVideo ? 'hidden' : 'flex'} absolute inset-0 flex-col items-center justify-center bg-gradient-to-br from-slate-900 to-slate-950">
@@ -1493,6 +1709,7 @@
 
       state.messages.push(newMsg);
       renderChatMessages();
+      broadcast({ type: 'chat', msg: newMsg });
 
       if (state.apiUrl) {
         callAppsScript('sendMessage', {
@@ -1722,6 +1939,10 @@
       state.remoteScreen = {};
       state.lastSeen = {};
       state.callAttempts = {};
+      state.peerInfo = {};
+      state.iceState = {};
+      state.rosterIds = [];
+      state.hostConnected = false;
 
       if (state.peer) {
         try { state.peer.destroy(); } catch (e) {}
@@ -1833,6 +2054,9 @@
           if (c && c.state === 'suspended') c.resume().catch(() => {});
         });
       };
+      window.addEventListener('beforeunload', () => {
+        try { if (state.peer) state.peer.destroy(); } catch (e) {}
+      });
       document.addEventListener('click', unlockMedia);
       document.addEventListener('touchstart', unlockMedia, { passive: true });
 
